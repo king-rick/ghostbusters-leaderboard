@@ -1,18 +1,17 @@
-# app.py
-# Ghostbusters Pinball Leaderboard (v2: removed "Machine" input, added default)
-
-import os
+from flask import Flask, render_template, request, redirect, flash
 import sqlite3
+import os
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, flash
 
 app = Flask(__name__)
-app.secret_key = "dev-secret-change-me"  # TODO: set a secure key via env var if deploying
 
-# --- Database ---------------------------------------------------------
+# Secret key: take from env in prod; safe default for local dev
+app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "pinball.db")
+# SQLite DB path: override on Render with DB_PATH=/tmp/pinball.db
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(__file__), "pinball.db"))
 
+# ---------- DATABASE HELPERS ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -20,79 +19,63 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    conn.executescript("""
-    CREATE TABLE IF NOT EXISTS scores (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      machine TEXT,
-      score INTEGER NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_scores_machine ON scores(machine);
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            score INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
     """)
     conn.commit()
     conn.close()
 
-# --- Routes -----------------------------------------------------------
-
+# ---------- ROUTES ----------
 @app.route("/")
-def home():
+def index():
     conn = get_db()
-    leaderboard = conn.execute("""
-        SELECT name, MAX(score) AS best_score
-        FROM scores
-        GROUP BY name
-        ORDER BY best_score DESC
-        LIMIT 10
-    """).fetchall()
-
-    recent = conn.execute("""
-        SELECT name, score, created_at
-        FROM scores
-        ORDER BY datetime(created_at) DESC
-        LIMIT 20
-    """).fetchall()
+    leaderboard = conn.execute(
+        "SELECT name, score, created_at FROM scores ORDER BY score DESC LIMIT 10"
+    ).fetchall()
+    recent = conn.execute(
+        "SELECT name, score, created_at FROM scores ORDER BY created_at DESC LIMIT 5"
+    ).fetchall()
     conn.close()
-
     return render_template("index.html", leaderboard=leaderboard, recent=recent)
 
 @app.route("/submit", methods=["POST"])
 def submit():
-    name = (request.form.get("name") or "").strip()
-    score_raw = (request.form.get("score") or "").replace(",", "").strip()
+    name = request.form.get("name", "").strip()
+    score_text = request.form.get("score", "").replace(",", "").strip()
 
-    if not name:
-        flash("Name is required.", "error")
-        return redirect(url_for("home"))
+    if not name or not score_text.isdigit():
+        flash("Invalid name or score.", "error")
+        return redirect("/")
 
-    try:
-        score = int(score_raw)
-        if score <= 0:
-            raise ValueError
-    except ValueError:
-        flash("Score must be a positive whole number.", "error")
-        return redirect(url_for("home"))
-
+    score = int(score_text)
     conn = get_db()
     conn.execute(
-        "INSERT INTO scores (name, machine, score, created_at) VALUES (?, ?, ?, ?)",
-        (name, 'Ghostbusters', score, datetime.utcnow().isoformat(timespec="seconds")),
+        "INSERT INTO scores (name, score, created_at) VALUES (?, ?, ?)",
+        (name, score, datetime.utcnow().isoformat(timespec="seconds"))
     )
     conn.commit()
     conn.close()
+    # fun randomized banner handled in template via flash text
+    flash("Score submitted successfully!", "ok")
+    return redirect("/")
 
-    flash("Score submitted!", "ok")
-    return redirect(url_for("home"))
+@app.route("/clear", methods=["POST"])
+def clear():
+    conn = get_db()
+    conn.execute("DELETE FROM scores")
+    conn.commit()
+    conn.close()
+    flash("Leaderboard cleared.", "ok")
+    return redirect("/")
 
-# --- Entrypoint -------------------------------------------------------
-
+# ---------- APP STARTUP (dev only; Gunicorn runs app:app in prod) ----------
 if __name__ == "__main__":
     init_db()
-    import sys
-    port = 5000
-    if "-p" in sys.argv:
-        try:
-            port = int(sys.argv[sys.argv.index("-p") + 1])
-        except Exception:
-            pass
-    app.run(debug=True, port=port)
+    port = int(os.environ.get("PORT", 5001))
+    # No debug flag here to satisfy security scanners.
+    app.run(host="127.0.0.1", port=port)
